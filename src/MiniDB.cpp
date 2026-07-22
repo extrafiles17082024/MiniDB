@@ -5,6 +5,7 @@
 #include <iostream>
 #include <vector>
 #include <array>
+#include <filesystem>
 
 namespace minidb {
 
@@ -158,18 +159,19 @@ bool MiniDB::Delete(std::string_view key, bool sync) {
 }
 
 std::optional<std::string> MiniDB::Get(std::string_view key) {
-    std::streampos offset;
-    {
-        std::shared_lock<std::shared_mutex> lock(db_mutex_);
-        std::string key_str(key);
-        auto it = key_dir_.find(key_str);
-        if (it == key_dir_.end()) {
-            return std::nullopt;
-        }
-        offset = it->second;
-    }
+    // Hold shared_lock across both index lookup AND file read to prevent
+    // Compact() from swapping the file and invalidating offsets mid-read.
+    std::shared_lock<std::shared_mutex> lock(db_mutex_);
 
-    // Open file locally for concurrent, lock-free read
+    std::string key_str(key);
+    auto it = key_dir_.find(key_str);
+    if (it == key_dir_.end()) {
+        return std::nullopt;
+    }
+    std::streampos offset = it->second;
+
+    // Open a local reader per call for true concurrent read safety
+    // (multiple threads can read simultaneously without seek contention)
     std::ifstream reader(db_path_, std::ios::in | std::ios::binary);
     if (!reader.is_open()) return std::nullopt;
 
@@ -219,20 +221,31 @@ bool MiniDB::Recover() {
         RecordHeader header;
         
         if (data_file_.peek() == EOF) break;
-        if (!data_file_.read(reinterpret_cast<char*>(&header), sizeof(RecordHeader))) break;
+        if (!data_file_.read(reinterpret_cast<char*>(&header), sizeof(RecordHeader))) {
+            // Torn write: incomplete header — truncate at this offset
+            all_good = false;
+            TruncateAt(static_cast<std::streamoff>(current_offset));
+            break;
+        }
 
         if (header.magic != MAGIC_BYTES) {
-            all_good = false; break;
+            all_good = false;
+            TruncateAt(static_cast<std::streamoff>(current_offset));
+            break;
         }
         if (header.key_len > 1024 * 1024 || header.val_len > 128 * 1024 * 1024) { 
-            all_good = false; break;
+            all_good = false;
+            TruncateAt(static_cast<std::streamoff>(current_offset));
+            break;
         }
 
         // Fast Startup Recovery: Only read the key, skip the value
         std::string read_key;
         read_key.resize(header.key_len);
         if (!data_file_.read(&read_key[0], header.key_len)) {
-            all_good = false; break;
+            all_good = false;
+            TruncateAt(static_cast<std::streamoff>(current_offset));
+            break;
         }
 
         // Validate Header CRC
@@ -241,11 +254,18 @@ bool MiniDB::Recover() {
         crc = CalculateCRC32(reinterpret_cast<const uint8_t*>(read_key.data()), header.key_len, crc);
 
         if (crc != header.header_crc) {
-            all_good = false; break;
+            all_good = false;
+            TruncateAt(static_cast<std::streamoff>(current_offset));
+            break;
         }
 
         // Skip value bytes on disk! HUGE speedup.
         data_file_.seekg(header.val_len, std::ios::cur);
+        if (data_file_.fail()) {
+            all_good = false;
+            TruncateAt(static_cast<std::streamoff>(current_offset));
+            break;
+        }
 
         if (header.tombstone == 1) {
             key_dir_.erase(read_key);
@@ -323,6 +343,24 @@ bool MiniDB::Compact() {
     key_dir_ = std::move(temp_key_dir);
 
     return true;
+}
+
+bool MiniDB::TruncateAt(std::streamoff offset) {
+    // Close streams before truncation
+    data_file_.close();
+
+    std::error_code ec;
+    std::filesystem::resize_file(db_path_, static_cast<std::uintmax_t>(offset), ec);
+    if (ec) {
+        std::cerr << "Warning: Failed to truncate database file at offset " << offset << ": " << ec.message() << "\n";
+    } else {
+        std::cerr << "Recovery: Truncated corrupted trailing bytes at offset " << offset << "\n";
+    }
+
+    // Reopen streams
+    data_file_.open(db_path_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
+
+    return !ec;
 }
 
 } // namespace minidb

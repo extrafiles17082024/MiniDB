@@ -37,13 +37,19 @@ int main() {
 
             if (cmd == "put") {
                 std::string key, val;
-                iss >> key;
+                if (!(iss >> key)) {
+                    std::cout << "Usage: put <key> <value>\n";
+                    continue;
+                }
                 std::getline(iss >> std::ws, val);
                 if (db.Put(key, val, true)) std::cout << "OK\n";
                 else std::cout << "Error writing to database.\n";
             } else if (cmd == "import") {
                 std::string filepath;
-                iss >> filepath;
+                if (!(iss >> filepath)) {
+                    std::cout << "Usage: import <csv_filepath>\n";
+                    continue;
+                }
                 std::ifstream csv(filepath);
                 if (!csv.is_open()) {
                     std::cout << "Failed to open file: " << filepath << "\n";
@@ -65,13 +71,19 @@ int main() {
                 }
             } else if (cmd == "get") {
                 std::string key;
-                iss >> key;
+                if (!(iss >> key)) {
+                    std::cout << "Usage: get <key>\n";
+                    continue;
+                }
                 auto val = db.Get(key);
                 if (val.has_value()) std::cout << val.value() << "\n";
                 else std::cout << "(not found)\n";
             } else if (cmd == "del") {
                 std::string key;
-                iss >> key;
+                if (!(iss >> key)) {
+                    std::cout << "Usage: del <key>\n";
+                    continue;
+                }
                 if (db.Delete(key, true)) std::cout << "OK\n";
                 else std::cout << "(not found)\n";
             } else if (cmd == "compact") {

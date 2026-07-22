@@ -13,11 +13,17 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    - name: Compile Tests
-      run: g++ -std=c++17 -I./include src/MiniDB.cpp tests/test_minidb.cpp -o test_minidb
+    - name: Configure CMake
+      run: cmake -B build
 
-    - name: Run Tests
-      run: ./test_minidb
+    - name: Build Project (Library, Tests, and CLI)
+      run: cmake --build build
 
-    - name: Compile CLI
-      run: g++ -std=c++17 -I./include src/MiniDB.cpp src/main.cpp -o minidb_cli
+    - name: Verify CLI Compilation (Smoke Test)
+      run: echo "help" | ./build/minidb_cli
+
+    - name: Run Tests (CTest)
+      run: ctest --test-dir build --output-on-failure
+
+    - name: Run Benchmarks (Stress Tests)
+      run: ./build/benchmark_minidb

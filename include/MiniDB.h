@@ -115,6 +115,14 @@ private:
      * @return True if successfully written.
      */
     bool AppendRecord(std::string_view key, std::string_view value, bool is_tombstone, bool sync, std::streampos& offset);
+
+    /**
+     * @brief Truncates the database file at the given offset.
+     * Used during recovery to remove corrupted trailing bytes from torn writes.
+     * @param offset The byte offset to truncate at.
+     * @return True if truncation was successful.
+     */
+    bool TruncateAt(std::streamoff offset);
 };
 
 } // namespace minidb

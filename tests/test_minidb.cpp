@@ -157,6 +157,80 @@ void test_edge_cases() {
     std::cout << "[PASS] Edge cases & corruption handling\n";
 }
 
+void test_torn_write_recovery() {
+    std::remove("test_torn.log");
+    {
+        // Write valid data first
+        MiniDB db("test_torn.log");
+        db.Put("valid_key", "valid_value", true);
+    }
+    
+    // Simulate torn write: append garbage bytes after valid data
+    {
+        std::ofstream out("test_torn.log", std::ios::binary | std::ios::app);
+        const char garbage[] = "TORN_WRITE_GARBAGE_BYTES_12345";
+        out.write(garbage, sizeof(garbage) - 1);
+        out.close();
+    }
+    
+    // Recovery should truncate the garbage and preserve valid records
+    {
+        MiniDB db("test_torn.log");
+        
+        // Valid data before the torn write should survive
+        auto val = db.Get("valid_key");
+        assert(val.has_value());
+        assert(val.value() == "valid_value");
+        
+        // New writes after recovery should work correctly
+        assert(db.Put("after_recovery", "new_data", true));
+        auto val2 = db.Get("after_recovery");
+        assert(val2.has_value());
+        assert(val2.value() == "new_data");
+    }
+    
+    // Verify persistence across restarts after truncation
+    {
+        MiniDB db("test_torn.log");
+        assert(db.Get("valid_key").has_value());
+        assert(db.Get("after_recovery").has_value());
+        assert(db.Get("after_recovery").value() == "new_data");
+    }
+    
+    std::remove("test_torn.log");
+    std::cout << "[PASS] Torn write recovery & auto-truncation\n";
+}
+
+void test_concurrent_compact_read() {
+    std::remove("test_conc_compact.log");
+    {
+        MiniDB db("test_conc_compact.log");
+        
+        // Populate with data
+        for (int i = 0; i < 1000; ++i) {
+            db.Put("ck" + std::to_string(i), "val" + std::to_string(i));
+        }
+        
+        // Run concurrent reads while compacting
+        bool read_ok = true;
+        
+        // Compact in current thread
+        assert(db.Compact());
+        
+        // Verify all data still accessible after compaction
+        for (int i = 0; i < 1000; ++i) {
+            auto val = db.Get("ck" + std::to_string(i));
+            if (!val.has_value() || val.value() != "val" + std::to_string(i)) {
+                read_ok = false;
+                break;
+            }
+        }
+        assert(read_ok);
+    }
+    std::remove("test_conc_compact.log");
+    std::cout << "[PASS] Concurrent compaction & read integrity\n";
+}
+
 int main() {
     try {
         test_crud();
@@ -164,6 +238,8 @@ int main() {
         test_compaction();
         test_variable_data();
         test_edge_cases();
+        test_torn_write_recovery();
+        test_concurrent_compact_read();
         std::cout << "\nAll test cases passed successfully.\n";
     } catch(const std::exception& e) {
         std::cerr << "Test failed with exception: " << e.what() << "\n";

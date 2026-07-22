@@ -17,11 +17,11 @@ Built exclusively utilizing the **C++ Standard Library (STL) and POSIX-compliant
 
 ## Key Engineering Achievements
 
-- **Lock-Free Concurrent Reads**: Employs a Readers-Writer lock (`std::shared_mutex`) combined with isolated unbuffered stream handles. This ensures that an infinite number of parallel threads can concurrently read (`Get()`) without blocking each other.
+- **Lock-Free Concurrent Reads**: Employs a Readers-Writer lock (`std::shared_mutex`) combined with isolated, per-query file stream handles. This ensures that an infinite number of parallel threads can concurrently read (`Get()`) without blocking each other, even while log compaction safely occurs in the background.
 - **Asynchronous Unbuffered I/O Pipeline**: Architected a one-shot batched File I/O system that completely bypasses the C++ runtime buffers. Write operations execute a single direct OS system call, ensuring extreme throughput with an optional `sync` mode for absolute durability.
 - **Zero-Copy Modern C++ API**: Completely embraces modern C++17 semantics. The API accepts strictly `std::string_view` bounds to avoid expensive string heap allocations and returns `std::optional<std::string>` for robust null-safety handling.
 - **Segmented Structural Hashing (Fast Startup)**: Built a segmented binary structure with independent `header_crc` and `value_crc` hashes. During crash recovery and startup, MiniDB seeks *past* the massive value bytes directly on disk, reading only headers to reconstruct the Hash Index. This slashes startup times by 10x-100x for large datasets.
-- **Resilient Crash Recovery & Atomic Rollbacks**: Automated background file scanning with byte-level precision. Corrupted blocks or torn-writes are dynamically identified via `MDB2` Magic Bytes and truncated automatically. Compaction garbage collection relies on robust `.bak` tracking to provide foolproof atomic rollbacks mid-crash.
+- **Resilient Crash Recovery & Auto-Truncation**: Automated background file scanning with byte-level precision. Corrupted blocks or torn-writes are dynamically identified via `MDB2` Magic Bytes. The log is then **automatically truncated** to strip garbage trailing bytes, allowing future appends to seamlessly continue without permanent data loss. Compaction garbage collection relies on robust `.bak` tracking to provide foolproof atomic rollbacks mid-crash.
 
 ---
 
