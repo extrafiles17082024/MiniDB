@@ -8,22 +8,38 @@ on:
 
 jobs:
   build_and_test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
 
     steps:
     - uses: actions/checkout@v3
 
     - name: Configure CMake
-      run: cmake -B build
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
     - name: Build Project (Library, Tests, and CLI)
-      run: cmake --build build
+      run: cmake --build build --config Release
 
     - name: Verify CLI Compilation (Smoke Test)
-      run: echo "help" | ./build/minidb_cli
+      run: |
+        if [ "$RUNNER_OS" == "Windows" ]; then
+          echo "help" | ./build/Release/minidb_cli.exe
+        else
+          echo "help" | ./build/minidb_cli
+        fi
 
     - name: Run Tests (CTest)
-      run: ctest --test-dir build --output-on-failure
+      run: ctest --test-dir build -C Release --output-on-failure
 
     - name: Run Benchmarks (Stress Tests)
-      run: ./build/benchmark_minidb
+      run: |
+        if [ "$RUNNER_OS" == "Windows" ]; then
+          ./build/Release/benchmark_minidb.exe
+        else
+          ./build/benchmark_minidb
+        fi
