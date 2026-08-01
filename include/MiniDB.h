@@ -10,6 +10,14 @@
 #include <shared_mutex>
 #include <mutex>
 
+#ifdef _WIN32
+    #include <windows.h>
+#else
+    #include <fcntl.h>
+    #include <unistd.h>
+    #include <cerrno>
+#endif
+
 namespace minidb {
 
 class MiniDB {
@@ -90,6 +98,16 @@ private:
 
     // Reusable write buffer to avoid heap allocations on every AppendRecord
     std::vector<char> write_buffer_;
+
+#ifdef _WIN32
+    HANDLE read_handle_ = INVALID_HANDLE_VALUE;
+#else
+    int read_fd_ = -1;
+#endif
+
+    bool OpenReadHandle();
+    void CloseReadHandle();
+    bool PRead(void* buf, size_t len, uint64_t offset);
 
     /**
      * @brief Recovers the hash index by reading the file sequentially on startup.

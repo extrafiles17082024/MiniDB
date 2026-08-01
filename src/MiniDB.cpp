@@ -41,15 +41,100 @@ MiniDB::MiniDB(const std::string& db_path) : db_path_(db_path) {
     if (!Recover()) {
         std::cerr << "Warning: Recovery encountered an error or a corrupt record in " << db_path_ << "\n";
     }
+
+    if (!OpenReadHandle()) {
+        throw std::runtime_error("Failed to open read handle for DB file: " + db_path_);
+    }
 }
 
 MiniDB::~MiniDB() {
     std::unique_lock<std::shared_mutex> lock(db_mutex_);
+    CloseReadHandle();
     if (data_file_.is_open()) {
         data_file_.flush();
         data_file_.close();
     }
 }
+
+#ifdef _WIN32
+
+bool MiniDB::OpenReadHandle() {
+    read_handle_ = CreateFileA(
+        db_path_.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+        NULL);
+    return read_handle_ != INVALID_HANDLE_VALUE;
+}
+
+void MiniDB::CloseReadHandle() {
+    if (read_handle_ != INVALID_HANDLE_VALUE) {
+        CloseHandle(read_handle_);
+        read_handle_ = INVALID_HANDLE_VALUE;
+    }
+}
+
+bool MiniDB::PRead(void* buf, size_t len, uint64_t offset) {
+    thread_local HANDLE tl_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    OVERLAPPED ov = {};
+    ov.Offset     = static_cast<DWORD>(offset & 0xFFFFFFFF);
+    ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
+    ov.hEvent     = tl_event;
+    ResetEvent(tl_event);
+
+    DWORD bytes_read = 0;
+    BOOL ok = ReadFile(read_handle_, buf, static_cast<DWORD>(len), &bytes_read, &ov);
+
+    if (!ok) {
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING) {
+            ok = GetOverlappedResult(read_handle_, &ov, &bytes_read, TRUE);
+        }
+    }
+
+    return ok && bytes_read == static_cast<DWORD>(len);
+}
+
+#else
+
+bool MiniDB::OpenReadHandle() {
+    read_fd_ = open(db_path_.c_str(), O_RDONLY);
+    return read_fd_ >= 0;
+}
+
+void MiniDB::CloseReadHandle() {
+    if (read_fd_ >= 0) {
+        close(read_fd_);
+        read_fd_ = -1;
+    }
+}
+
+bool MiniDB::PRead(void* buf, size_t len, uint64_t offset) {
+    char* ptr = static_cast<char*>(buf);
+    size_t remaining = len;
+
+    while (remaining > 0) {
+        ssize_t bytes_read = pread(read_fd_, ptr, remaining, offset);
+        if (bytes_read < 0) {
+            if (errno == EINTR) continue;  // Signal interrupted, retry
+            return false;                   // Real error
+        }
+        if (bytes_read == 0) {
+            return false;  // Unexpected EOF
+        }
+        ptr      += bytes_read;
+        offset   += bytes_read;
+        remaining -= bytes_read;
+    }
+    return true;
+}
+
+#endif
+
 
 static const std::array<uint32_t, 256>& GetCRC32Table() {
     static const std::array<uint32_t, 256> table = []() {
@@ -125,9 +210,8 @@ bool MiniDB::AppendRecord(std::string_view key, std::string_view value, bool is_
 
     // Single write syscall
     data_file_.write(write_buffer_.data(), total_size);
-    if (sync) {
-        data_file_.flush();
-    }
+    data_file_.flush();  // Always flush so pread/ReadFile sees the data
+    (void)sync; // Suppress unused parameter warning
 
     return data_file_.good();
 }
@@ -159,51 +243,30 @@ bool MiniDB::Delete(std::string_view key, bool sync) {
 }
 
 std::optional<std::string> MiniDB::Get(std::string_view key) {
-    // Hold shared_lock across both index lookup AND file read to prevent
-    // Compact() from swapping the file and invalidating offsets mid-read.
     std::shared_lock<std::shared_mutex> lock(db_mutex_);
 
     std::string key_str(key);
     auto it = key_dir_.find(key_str);
-    if (it == key_dir_.end()) {
-        return std::nullopt;
-    }
-    std::streampos offset = it->second;
+    if (it == key_dir_.end()) return std::nullopt;
 
-    // Open a local reader per call for true concurrent read safety
-    // (multiple threads can read simultaneously without seek contention)
-    std::ifstream reader(db_path_, std::ios::in | std::ios::binary);
-    if (!reader.is_open()) return std::nullopt;
+    uint64_t offset = static_cast<uint64_t>(it->second);
 
-    reader.seekg(offset, std::ios::beg);
-
+    // Read header via pread/ReadFile
     RecordHeader header;
-    if (!reader.read(reinterpret_cast<char*>(&header), sizeof(RecordHeader))) {
-        return std::nullopt; // IO error
-    }
+    if (!PRead(&header, sizeof(RecordHeader), offset)) return std::nullopt;
+    if (header.magic != MAGIC_BYTES) return std::nullopt;
+    if (header.key_len > 1024 * 1024 || header.val_len > 128 * 1024 * 1024) return std::nullopt;
 
-    if (header.magic != MAGIC_BYTES) {
-        return std::nullopt; // Corrupt record
-    }
-
-    // Protect against OOM from corrupt records
-    if (header.key_len > 1024 * 1024 || header.val_len > 128 * 1024 * 1024) {
-        return std::nullopt;
-    }
-
-    // Seek past key (we already know it matches from hash map)
-    reader.seekg(header.key_len, std::ios::cur);
-
+    // Read value (skip past header + key)
+    uint64_t value_offset = offset + sizeof(RecordHeader) + header.key_len;
     std::string value;
     value.resize(header.val_len);
-    if (!reader.read(&value[0], header.val_len)) {
-        return std::nullopt;
-    }
+    if (!PRead(&value[0], header.val_len, value_offset)) return std::nullopt;
 
-    uint32_t val_crc = CalculateCRC32(reinterpret_cast<const uint8_t*>(value.data()), header.val_len);
-    if (val_crc != header.value_crc) {
-        return std::nullopt; // Corruption
-    }
+    // Validate CRC
+    uint32_t val_crc = CalculateCRC32(
+        reinterpret_cast<const uint8_t*>(value.data()), header.val_len);
+    if (val_crc != header.value_crc) return std::nullopt;
 
     return value;
 }
@@ -314,6 +377,8 @@ bool MiniDB::Compact() {
     compact_file.flush();
     compact_file.close();
     data_file_.close();
+    
+    CloseReadHandle();
 
     // More robust atomic rename simulation utilizing backup tracking
     std::string backup_path = db_path_ + ".bak";
@@ -340,6 +405,10 @@ bool MiniDB::Compact() {
         return false; // Critical failure
     }
 
+    if (!OpenReadHandle()) {
+        return false;
+    }
+
     key_dir_ = std::move(temp_key_dir);
 
     return true;
@@ -348,6 +417,7 @@ bool MiniDB::Compact() {
 bool MiniDB::TruncateAt(std::streamoff offset) {
     // Close streams before truncation
     data_file_.close();
+    CloseReadHandle();
 
     std::error_code ec;
     std::filesystem::resize_file(db_path_, static_cast<std::uintmax_t>(offset), ec);
@@ -359,6 +429,8 @@ bool MiniDB::TruncateAt(std::streamoff offset) {
 
     // Reopen streams
     data_file_.open(db_path_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
+    
+    OpenReadHandle();
 
     return !ec;
 }
