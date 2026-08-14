@@ -3,6 +3,7 @@
 #include <cassert>
 #include <fstream>
 #include <cstdio>
+#include <filesystem>
 
 using namespace minidb;
 
@@ -201,6 +202,16 @@ void test_torn_write_recovery() {
     std::cout << "[PASS] Torn write recovery & auto-truncation\n";
 }
 
+void test_truncated_payload_recovery() {
+    std::remove("test_truncated.log");
+    { MiniDB db("test_truncated.log"); assert(db.Put("key", "value", true)); }
+    auto size = get_file_size("test_truncated.log");
+    std::filesystem::resize_file("test_truncated.log", size - 2);
+    { MiniDB db("test_truncated.log"); assert(!db.Get("key").has_value()); assert(db.Put("after", "ok", true)); }
+    std::remove("test_truncated.log");
+    std::cout << "[PASS] Truncated payload recovery\n";
+}
+
 void test_concurrent_compact_read() {
     std::remove("test_conc_compact.log");
     {
@@ -239,6 +250,7 @@ int main() {
         test_variable_data();
         test_edge_cases();
         test_torn_write_recovery();
+        test_truncated_payload_recovery();
         test_concurrent_compact_read();
         std::cout << "\nAll test cases passed successfully.\n";
     } catch(const std::exception& e) {
