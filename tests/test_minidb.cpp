@@ -205,8 +205,10 @@ void test_torn_write_recovery() {
 void test_truncated_payload_recovery() {
     std::remove("test_truncated.log");
     { MiniDB db("test_truncated.log"); assert(db.Put("key", "value", true)); }
+    { std::ofstream out("test_truncated.log", std::ios::binary | std::ios::app); out << "xx"; }
     auto size = get_file_size("test_truncated.log");
-    std::filesystem::resize_file("test_truncated.log", size - 2);
+    assert(size > 4);
+    std::filesystem::resize_file("test_truncated.log", size - 4);
     { MiniDB db("test_truncated.log"); assert(!db.Get("key").has_value()); assert(db.Put("after", "ok", true)); }
     std::remove("test_truncated.log");
     std::cout << "[PASS] Truncated payload recovery\n";
