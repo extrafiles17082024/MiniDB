@@ -108,6 +108,7 @@ private:
     bool OpenReadHandle();
     void CloseReadHandle();
     bool PRead(void* buf, size_t len, uint64_t offset);
+    bool FlushToDisk();
 
     /**
      * @brief Recovers the hash index by reading the file sequentially on startup.
