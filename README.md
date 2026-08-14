@@ -138,8 +138,6 @@ int main() {
 
 ---
 
-> Reliability fixes and regression tests are being validated on the `fix/p0-reliability` branch with the repository CI workflow. The `sync` option requests a disk flush; callers should still choose storage and filesystem settings appropriate for their durability requirements.
-
 ## Contributions
 Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/Komal-ai417/minidb/issues).
 
