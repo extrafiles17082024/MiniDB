@@ -7,10 +7,6 @@
 #include <array>
 #include <filesystem>
 
-#ifndef _WIN32
-#include <sys/stat.h>
-#endif
-
 namespace minidb {
 
 MiniDB::MiniDB(const std::string& db_path) : db_path_(db_path) {
