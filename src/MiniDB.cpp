@@ -7,6 +7,10 @@
 #include <array>
 #include <filesystem>
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
+
 namespace minidb {
 
 MiniDB::MiniDB(const std::string& db_path) : db_path_(db_path) {
@@ -114,6 +118,7 @@ void MiniDB::CloseReadHandle() {
 }
 
 bool MiniDB::PRead(void* buf, size_t len, uint64_t offset) {
+    if (len == 0) return true;
     char* ptr = static_cast<char*>(buf);
     size_t remaining = len;
 
@@ -135,6 +140,21 @@ bool MiniDB::PRead(void* buf, size_t len, uint64_t offset) {
 
 #endif
 
+
+bool MiniDB::FlushToDisk() {
+#ifdef _WIN32
+    HANDLE h = CreateFileA(db_path_.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    BOOL ok = FlushFileBuffers(h);
+    CloseHandle(h);
+    return ok != FALSE;
+#else
+    int fd = open(db_path_.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    int rc; do { rc = fsync(fd); } while (rc != 0 && errno == EINTR);
+    close(fd); return rc == 0;
+#endif
+}
 
 static const std::array<uint32_t, 256>& GetCRC32Table() {
     static const std::array<uint32_t, 256> table = []() {
@@ -210,10 +230,10 @@ bool MiniDB::AppendRecord(std::string_view key, std::string_view value, bool is_
 
     // Single write syscall
     data_file_.write(write_buffer_.data(), total_size);
-    data_file_.flush();  // Always flush so pread/ReadFile sees the data
-    (void)sync; // Suppress unused parameter warning
-
-    return data_file_.good();
+    data_file_.flush();
+    if (!data_file_.good()) return false;
+    if (sync && !FlushToDisk()) return false;
+    return true;
 }
 
 bool MiniDB::Put(std::string_view key, std::string_view value, bool sync) {
@@ -257,11 +277,16 @@ std::optional<std::string> MiniDB::Get(std::string_view key) {
     if (header.magic != MAGIC_BYTES) return std::nullopt;
     if (header.key_len > 1024 * 1024 || header.val_len > 128 * 1024 * 1024) return std::nullopt;
 
-    // Read value (skip past header + key)
+    // Validate header, key, and tombstone before reading the value.
+    std::string stored_key(header.key_len, '\0');
+    if (!PRead(stored_key.data(), header.key_len, offset + sizeof(RecordHeader))) return std::nullopt;
+    uint32_t header_crc = CalculateCRC32(reinterpret_cast<const uint8_t*>(&header.timestamp), sizeof(uint64_t) + sizeof(uint8_t) + sizeof(uint32_t) + sizeof(uint32_t));
+    header_crc = CalculateCRC32(reinterpret_cast<const uint8_t*>(stored_key.data()), header.key_len, header_crc);
+    if (header_crc != header.header_crc || stored_key != key_str || header.tombstone != 0) return std::nullopt;
+
     uint64_t value_offset = offset + sizeof(RecordHeader) + header.key_len;
-    std::string value;
-    value.resize(header.val_len);
-    if (!PRead(&value[0], header.val_len, value_offset)) return std::nullopt;
+    std::string value(header.val_len, '\0');
+    if (!PRead(value.data(), header.val_len, value_offset)) return std::nullopt;
 
     // Validate CRC
     uint32_t val_crc = CalculateCRC32(
@@ -303,9 +328,10 @@ bool MiniDB::Recover() {
         }
 
         // Fast Startup Recovery: Only read the key, skip the value
-        std::string read_key;
-        read_key.resize(header.key_len);
-        if (!data_file_.read(&read_key[0], header.key_len)) {
+        if (header.tombstone > 1) { all_good = false; TruncateAt(static_cast<std::streamoff>(current_offset)); break; }
+
+        std::string read_key(header.key_len, '\0');
+        if (header.key_len > 0 && !data_file_.read(read_key.data(), header.key_len)) {
             all_good = false;
             TruncateAt(static_cast<std::streamoff>(current_offset));
             break;
@@ -322,7 +348,11 @@ bool MiniDB::Recover() {
             break;
         }
 
-        // Skip value bytes on disk! HUGE speedup.
+        std::error_code size_ec;
+        const auto file_size = std::filesystem::file_size(db_path_, size_ec);
+        const auto value_end = static_cast<std::uintmax_t>(current_offset) + sizeof(RecordHeader) + header.key_len + header.val_len;
+        if (size_ec || value_end > file_size) { all_good = false; TruncateAt(static_cast<std::streamoff>(current_offset)); break; }
+
         data_file_.seekg(header.val_len, std::ios::cur);
         if (data_file_.fail()) {
             all_good = false;
@@ -342,13 +372,12 @@ bool MiniDB::Recover() {
 }
 
 bool MiniDB::Compact() {
+    std::unique_lock<std::shared_mutex> lock(db_mutex_);
     std::string compact_file_path = db_path_ + ".compact";
     std::unordered_map<std::string, std::streampos> temp_key_dir;
 
-    std::ofstream compact_file(compact_file_path, std::ios::out | std::ios::binary);
+    std::ofstream compact_file(compact_file_path, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!compact_file.is_open()) return false;
-
-    std::unique_lock<std::shared_mutex> lock(db_mutex_);
 
     for (const auto& pair : key_dir_) {
         const std::string& key = pair.first;
@@ -358,23 +387,25 @@ bool MiniDB::Compact() {
         data_file_.seekg(old_offset, std::ios::beg);
 
         RecordHeader header;
-        data_file_.read(reinterpret_cast<char*>(&header), sizeof(RecordHeader));
+        if (!data_file_.read(reinterpret_cast<char*>(&header), sizeof(RecordHeader)) || header.magic != MAGIC_BYTES || header.tombstone != 0 || header.key_len > 1024 * 1024 || header.val_len > 128 * 1024 * 1024) { compact_file.close(); std::remove(compact_file_path.c_str()); return false; }
         
         size_t var_len = header.key_len + header.val_len;
         if (write_buffer_.size() < var_len) {
             write_buffer_.resize(var_len);
         }
-        data_file_.read(write_buffer_.data(), var_len);
+        if (!data_file_.read(write_buffer_.data(), var_len)) { compact_file.close(); std::remove(compact_file_path.c_str()); return false; }
         
         std::streampos new_offset = compact_file.tellp();
         
         compact_file.write(reinterpret_cast<const char*>(&header), sizeof(RecordHeader));
         compact_file.write(write_buffer_.data(), var_len);
+        if (!compact_file.good()) { compact_file.close(); std::remove(compact_file_path.c_str()); return false; }
         
         temp_key_dir[key] = new_offset;
     }
 
     compact_file.flush();
+    if (!compact_file.good()) { compact_file.close(); std::remove(compact_file_path.c_str()); return false; }
     compact_file.close();
     data_file_.close();
     
