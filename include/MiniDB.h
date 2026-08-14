@@ -9,7 +9,6 @@
 #include <vector>
 #include <shared_mutex>
 #include <mutex>
-#include <stdexcept>
 
 #ifdef _WIN32
     #include <windows.h>
